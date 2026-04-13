@@ -305,16 +305,18 @@ def parse_args():
                    help="WaveDM noise level t (default: 250).")
 
     # FreqDDPM (Ours) parameters — tuned to beat WaveDM
-    p.add_argument("--ours_t",            type=int,   default=170,
-                   help="Base DDPM noise level for Ours (default: 170).")
-    p.add_argument("--ours_ll_alpha",     type=float, default=0.65,
-                   help="LL subband blend weight for Ours (default: 0.65).")
-    p.add_argument("--ours_hf_alpha",     type=float, default=0.40,
-                   help="HF subband blend weight for Ours (default: 0.40).")
+    p.add_argument("--ours_t",            type=int,   default=150,
+                   help="Base DDPM noise level for Ours (default: 150).")
+    p.add_argument("--ours_ll_alpha",     type=float, default=0.70,
+                   help="LL subband blend weight for Ours (default: 0.70).")
+    p.add_argument("--ours_hf_alpha",     type=float, default=0.20,
+                   help="HF subband blend weight for Ours (default: 0.20).")
     p.add_argument("--ours_threshold_l1", type=float, default=0.020,
                    help="Level-1 wavelet soft-threshold for Ours (default: 0.020).")
     p.add_argument("--ours_threshold_l2", type=float, default=0.010,
                    help="Level-2 wavelet soft-threshold for Ours (default: 0.010).")
+    p.add_argument("--ours_t_refine",     type=int,   default=25,
+                   help="Polish-pass DDPM steps after fusion (0=disabled; default: 25).")
     p.add_argument("--ours_no_adaptive",  action="store_true",
                    help="Disable adaptive t scaling for Ours.")
 
@@ -402,6 +404,7 @@ def main():
                 hf_blend_alpha=args.ours_hf_alpha,
                 threshold_l1=args.ours_threshold_l1,
                 threshold_l2=args.ours_threshold_l2,
+                t_refine=args.ours_t_refine,
                 adaptive=not args.ours_no_adaptive,
                 device=str(device),
             )
