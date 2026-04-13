@@ -63,11 +63,22 @@ from guided_diffusion.script_util import (
 # Multi-level wavelet helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+_DWT_MODE = "periodization"
+"""
+DWT boundary mode.  'periodization' is the only pywt mode that is strictly
+bijective: dwt2(N) → ceil(N/2) subbands, idwt2(ceil(N/2)) → N, regardless
+of the wavelet filter length.  Using 'symmetric' with longer wavelets (e.g.
+db4) on non-power-of-2 inputs can produce ambiguous subband sizes that cause
+idwt2 to raise "coeffs must all be of equal size", which is what happens for
+typical ImageNet images (224×224).
+"""
+
+
 def _dwt2(x: np.ndarray, wavelet: str = "db4") -> tuple:
     """Single-level 2-D DWT on a CHW float array."""
     LL_list, LH_list, HL_list, HH_list = [], [], [], []
     for c in range(x.shape[0]):
-        LL_c, (LH_c, HL_c, HH_c) = pywt.dwt2(x[c], wavelet)
+        LL_c, (LH_c, HL_c, HH_c) = pywt.dwt2(x[c], wavelet, mode=_DWT_MODE)
         LL_list.append(LL_c)
         LH_list.append(LH_c)
         HL_list.append(HL_c)
@@ -85,7 +96,7 @@ def _idwt2(LL: np.ndarray, LH: np.ndarray, HL: np.ndarray,
     """Single-level 2-D IDWT, returns CHW float array."""
     recon = []
     for c in range(LL.shape[0]):
-        r = pywt.idwt2((LL[c], (LH[c], HL[c], HH[c])), wavelet)
+        r = pywt.idwt2((LL[c], (LH[c], HL[c], HH[c])), wavelet, mode=_DWT_MODE)
         recon.append(r)
     return np.stack(recon, axis=0)
 
@@ -119,8 +130,11 @@ def _multilevel_wavelet_denoise(
     HL2 = _soft_threshold(HL2, threshold_l2)
     HH2 = _soft_threshold(HH2, threshold_l2)
 
-    # Reconstruct LL1 from level-2 coefficients
+    # Reconstruct LL1 from level-2 coefficients.
+    # Crop to exactly match LH1/HL1/HH1 shape — 'periodization' mode keeps
+    # the round-trip exact, but we guard against any off-by-one edge case.
     LL1_recon = _idwt2(LL2, LH2, HL2, HH2, wavelet)
+    LL1_recon = LL1_recon[:, :LH1.shape[1], :LH1.shape[2]]
 
     # Reconstruct the full image from level-1 coefficients (using reconstructed LL1)
     recon = _idwt2(LL1_recon, LH1, HL1, HH1, wavelet)
