@@ -173,6 +173,11 @@ class OursPurifier:
     # Adaptive strength estimation
     # ------------------------------------------------------------------ #
 
+    # Threshold below which the perturbation is considered benign (ε=4/255 ≈ 0.016)
+    _BASE_EPS: float = 0.016
+    # Each doubling of perturbation beyond _BASE_EPS adds this much extra strength
+    _STRENGTH_SCALE_FACTOR: float = 0.15
+
     @staticmethod
     def _estimate_strength(adv: torch.Tensor, clean_approx: torch.Tensor,
                            base: float) -> float:
@@ -181,9 +186,10 @@ class OursPurifier:
 
         adv and clean_approx are CHW or (1,C,H,W) tensors in [0,1].
         """
+        _BASE_EPS = 0.016          # ε=4/255
+        _STRENGTH_SCALE_FACTOR = 0.15
         diff = (adv.float() - clean_approx.float()).abs().max().item()
-        # eps=4/255≈0.016 → strength≈base; eps=8/255≈0.031 → strength≈base+0.05
-        scale = 1.0 + max(0.0, diff - 0.016) / 0.016 * 0.15
+        scale = 1.0 + max(0.0, diff - _BASE_EPS) / _BASE_EPS * _STRENGTH_SCALE_FACTOR
         return float(min(base * scale, 0.65))
 
     # ------------------------------------------------------------------ #

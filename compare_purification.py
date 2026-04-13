@@ -219,9 +219,11 @@ _TITLES = [
     "Ours / FreqLDM\n(Purified)",
 ]
 
+# Reference values from Table 4.6 of the paper (used as a sanity-check reference).
+# These are the expected metrics for each method when evaluated on the test set.
 _TARGET_METRICS = {
-    "DiffPure\n(Purified)":      {"ssim": 0.876, "psnr": 28.6, "lpips": 0.112},
-    "WaveDM\n(Purified)":        {"ssim": 0.898, "psnr": 31.2, "lpips": 0.085},
+    "DiffPure\n(Purified)":       {"ssim": 0.876, "psnr": 28.6, "lpips": 0.112},
+    "WaveDM\n(Purified)":         {"ssim": 0.898, "psnr": 31.2, "lpips": 0.085},
     "Ours / FreqLDM\n(Purified)": {"ssim": 0.905, "psnr": 30.9, "lpips": 0.071},
 }
 
@@ -356,9 +358,10 @@ def main():
         print("[→] Running DiffPure ...")
         try:
             dp_clean = run_diffpure(adv_t, args.model_dir, args.diffpure_t, device)
-            images["DiffPure\n(Purified)"]  = tensor_to_np(dp_clean)
-            metrics["DiffPure\n(Purified)"] = compute_metrics(orig_t, dp_clean, device)
-            print(f"    DiffPure  {metrics['DiffPure\\n(Purified)']}")
+            key = "DiffPure\n(Purified)"
+            images[key]  = tensor_to_np(dp_clean)
+            metrics[key] = compute_metrics(orig_t, dp_clean, device)
+            print(f"    DiffPure  {metrics[key]}")
         except FileNotFoundError as exc:
             warnings.warn(str(exc))
             print("[!] DiffPure skipped (weights missing).")
@@ -378,9 +381,10 @@ def main():
                 device=str(device),
             )
             wdm_clean = wavedm.purify(adv_t)
-            images["WaveDM\n(Purified)"]  = tensor_to_np(wdm_clean)
-            metrics["WaveDM\n(Purified)"] = compute_metrics(orig_t, wdm_clean, device)
-            print(f"    WaveDM    {metrics['WaveDM\\n(Purified)']}")
+            key = "WaveDM\n(Purified)"
+            images[key]  = tensor_to_np(wdm_clean)
+            metrics[key] = compute_metrics(orig_t, wdm_clean, device)
+            print(f"    WaveDM    {metrics[key]}")
         except FileNotFoundError as exc:
             warnings.warn(str(exc))
             print("[!] WaveDM skipped (weights missing).")
@@ -403,11 +407,10 @@ def main():
                 device=str(device),
             )
             ours_clean = ours.purify(adv_t)
-            images["Ours / FreqLDM\n(Purified)"]  = tensor_to_np(ours_clean)
-            metrics["Ours / FreqLDM\n(Purified)"] = compute_metrics(
-                orig_t, ours_clean, device
-            )
-            print(f"    Ours      {metrics['Ours / FreqLDM\\n(Purified)']}")
+            key = "Ours / FreqLDM\n(Purified)"
+            images[key]  = tensor_to_np(ours_clean)
+            metrics[key] = compute_metrics(orig_t, ours_clean, device)
+            print(f"    Ours      {metrics[key]}")
         except Exception as exc:
             warnings.warn(f"Ours (FreqLDM) failed: {exc}")
             print("[!] Ours skipped.")
