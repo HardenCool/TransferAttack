@@ -103,8 +103,45 @@ class DiTPurifier:
         source = model_path if model_path else model_id
         print(f"DiTPurifier: loading model from '{source}' …")
 
-        # Load the full pipeline; we only keep the transformer + scheduler
-        pipe = DiTPipeline.from_pretrained(source, torch_dtype=torch.float32)
+        # Load the full pipeline; we only keep the transformer + scheduler.
+        # When no local path is given, first try the HuggingFace Hub; if the
+        # network is unavailable, fall back to the local cache (offline mode).
+        try:
+            pipe = DiTPipeline.from_pretrained(source, torch_dtype=torch.float32)
+        except (OSError, EnvironmentError) as exc:
+            if model_path:
+                # The caller gave an explicit local path — surface the error.
+                raise OSError(
+                    f"Failed to load DiT model from local path '{model_path}'.\n"
+                    f"Make sure the directory exists and contains a valid "
+                    f"diffusers snapshot (config.json, model_index.json, …).\n"
+                    f"Original error: {exc}"
+                ) from exc
+
+            # Try the local HuggingFace cache before giving up.
+            print(
+                f"DiTPurifier: Hub download failed ({exc}). "
+                "Trying local cache (local_files_only=True) …"
+            )
+            try:
+                pipe = DiTPipeline.from_pretrained(
+                    source,
+                    torch_dtype=torch.float32,
+                    local_files_only=True,
+                )
+            except (OSError, EnvironmentError):
+                raise OSError(
+                    f"Cannot load DiT model '{source}': not cached locally and "
+                    "the HuggingFace Hub is unreachable.\n\n"
+                    "To fix this, download the model on a machine with internet "
+                    "access and copy it to your machine:\n\n"
+                    "  from huggingface_hub import snapshot_download\n"
+                    "  snapshot_download('facebook/DiT-XL-2-256',\n"
+                    "                    local_dir='/path/to/DiT-XL-2-256')\n\n"
+                    "Then pass the local directory to the script:\n\n"
+                    "  python defense/compare_purification.py \\\n"
+                    "      --dit_model_path /path/to/DiT-XL-2-256 ...\n"
+                ) from exc
         self.transformer = pipe.transformer.eval().to(self.device)
         self.transformer.requires_grad_(False)
 
