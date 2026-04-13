@@ -1,34 +1,32 @@
 """
-Ours: Frequency-Guided Latent Diffusion Purification (FreqLDM).
+Ours: Multi-Scale Frequency-Guided DDPM Purification (FreqDDPM).
 
 This method is the main contribution of the paper.  It improves upon WaveDM by
-replacing the pixel-domain DDPM backbone with a Latent Diffusion Model (LDM),
-specifically Stable Diffusion v1-5, and incorporating wavelet-based frequency
-guidance during the reverse process.
+adding three key enhancements to the DDPM-based purification pipeline:
 
 Key innovations over WaveDM / DiffPure:
-  1. **Latent-space diffusion** — operates in the compact perceptual latent space
-     of the VAE encoder, which yields better LPIPS and SSIM scores while keeping
-     inference fast.
-  2. **Frequency-guided output blending** — the LL (low-frequency) subband of the
-     original/wavelet-pre-denoised image is blended back into the LDM output to
-     preserve large-scale structure, improving SSIM.
-  3. **Adaptive strength** — the img2img noise strength is estimated from the
-     measured l∞-norm of the adversarial perturbation so that clean images are
-     modified minimally while heavily perturbed images receive stronger denoising.
+  1. **Two-level wavelet pre-denoising** — adversarial noise is suppressed at
+     two frequency scales before the diffusion step, yielding a cleaner input
+     for the reverse pass and enabling a lower (less-destructive) noise level.
+  2. **Lower diffusion noise level** (t=170 vs. WaveDM's t=250) — the reverse
+     pass restores local detail without overwriting global structure.
+  3. **Post-diffusion LL + HF subband fusion** — after the reverse pass, the
+     low-frequency (LL) subband from the wavelet-pre-denoised image is blended
+     back at a high weight (alpha=0.65) to restore global structure (SSIM), and
+     the high-frequency (LH/HL/HH) subbands are partially restored (beta=0.40)
+     to preserve edges and texture (LPIPS).
+  4. **Adaptive noise level** — t is scaled with the estimated l∞ perturbation
+     magnitude so that lightly-perturbed images are minimally modified.
 
-Pretrained weight (downloaded automatically via HuggingFace Hub):
-  runwayml/stable-diffusion-v1-5
-  (~4 GB, stored in ~/.cache/huggingface by default)
-
-Alternatively, set the environment variable HF_HOME to a custom cache directory,
-or pass ``model_id`` to point at a local directory / alternative model.
+Pretrained weight (same file as DiffPure and WaveDM — no extra download):
+  defense/models/256x256_diffusion_uncond.pt
+  Download: bash defense/ours/download_weights.sh
 
 Usage:
     from defense.ours.ours_purify import OursPurifier
 
-    purifier = OursPurifier(device='cuda')          # loads SD weights once
-    clean_img = purifier.purify(adv_img)            # (C,H,W) or (B,C,H,W) in [0,1]
+    purifier = OursPurifier(model_dir='defense/models', device='cuda')
+    clean_img = purifier.purify(adv_img)   # (C,H,W) or (B,C,H,W) in [0,1]
 """
 
 import os
@@ -37,7 +35,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ── PyWavelets (same as WaveDM) ───────────────────────────────────────────────
+# ── PyWavelets ────────────────────────────────────────────────────────────────
 try:
     import pywt
 except ImportError as e:
@@ -45,20 +43,20 @@ except ImportError as e:
         "PyWavelets is required.  Install with: pip install PyWavelets"
     ) from e
 
-# ── HuggingFace Diffusers ─────────────────────────────────────────────────────
-try:
-    from diffusers import StableDiffusionImg2ImgPipeline
-except ImportError as e:
-    raise ImportError(
-        "diffusers is required for OursPurifier.  Install with:\n"
-        "  pip install diffusers[torch] transformers accelerate"
-    ) from e
+# ── Guided-diffusion backbone (shared with DiffPure and WaveDM) ───────────────
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DIFFPURE_DIR = os.path.join(os.path.dirname(_THIS_DIR), "diffpure")
+if _DIFFPURE_DIR not in sys.path:
+    sys.path.insert(0, _DIFFPURE_DIR)
 
-from PIL import Image
+from guided_diffusion.script_util import (
+    create_model_and_diffusion,
+    model_and_diffusion_defaults,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Wavelet helper (shared with WaveDM)
+# Multi-level wavelet helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _dwt2(x: np.ndarray, wavelet: str = "haar") -> tuple:
@@ -92,162 +90,144 @@ def _soft_threshold(x: np.ndarray, threshold: float) -> np.ndarray:
     return np.sign(x) * np.maximum(np.abs(x) - threshold, 0.0)
 
 
-def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
-    """Convert a CHW float [0,1] tensor to a PIL RGB image."""
-    arr = (t.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-    return Image.fromarray(arr.transpose(1, 2, 0))
+def _multilevel_wavelet_denoise(
+    img: np.ndarray,
+    wavelet: str = "haar",
+    threshold_l1: float = 0.020,
+    threshold_l2: float = 0.010,
+) -> np.ndarray:
+    """
+    Two-level wavelet soft-thresholding denoising on a CHW [0,1] array.
 
+    Level 1: DWT on the full image, threshold HF subbands at ``threshold_l1``.
+    Level 2: DWT on the level-1 LL subband, threshold at ``threshold_l2``.
+    Both levels are reconstructed via IDWT.
+    """
+    # Level-1 decomposition
+    LL1, LH1, HL1, HH1 = _dwt2(img, wavelet)
+    LH1 = _soft_threshold(LH1, threshold_l1)
+    HL1 = _soft_threshold(HL1, threshold_l1)
+    HH1 = _soft_threshold(HH1, threshold_l1)
 
-def _pil_to_tensor(img: Image.Image) -> torch.Tensor:
-    """Convert a PIL RGB image to a CHW float [0,1] tensor."""
-    arr = np.array(img).astype(np.float32) / 255.0
-    return torch.from_numpy(arr.transpose(2, 0, 1))
+    # Level-2 decomposition on the LL1 subband
+    LL2, LH2, HL2, HH2 = _dwt2(LL1, wavelet)
+    LH2 = _soft_threshold(LH2, threshold_l2)
+    HL2 = _soft_threshold(HL2, threshold_l2)
+    HH2 = _soft_threshold(HH2, threshold_l2)
+
+    # Reconstruct LL1 from level-2 coefficients
+    LL1_recon = _idwt2(LL2, LH2, HL2, HH2, wavelet)
+
+    # Reconstruct the full image from level-1 coefficients (using reconstructed LL1)
+    recon = _idwt2(LL1_recon, LH1, HL1, HH1, wavelet)
+    return np.clip(recon, 0.0, 1.0).astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Frequency-Guided Latent Diffusion (Ours)
+# Frequency-Guided DDPM Purification (Ours)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OursPurifier:
     """
-    Frequency-Guided Latent Diffusion Purification (FreqLDM — 'Ours').
+    Multi-Scale Frequency-Guided DDPM Purification (FreqDDPM — 'Ours').
 
     Parameters
     ----------
-    model_id          : HuggingFace model id or local path to a
-                        StableDiffusionImg2ImgPipeline-compatible checkpoint.
-                        Default: ``"runwayml/stable-diffusion-v1-5"``.
-    base_strength     : base img2img noise strength (fraction of total steps).
-                        0.0 = no change; 1.0 = generate from scratch.
-                        Values in [0.30, 0.45] give the best SSIM / LPIPS balance.
-                        Default: 0.35.
-    guidance_scale    : classifier-free guidance scale; 1.0 disables it so that
-                        the model acts purely as a denoiser.
-                        Default: 1.0.
-    num_inf_steps     : number of DDIM denoising steps.  25-50 is usually enough.
-                        Default: 30.
-    ll_blend_alpha    : weight for low-frequency (LL subband) blending.
-                        Higher alpha preserves more large-scale structure.
-                        Default: 0.15.
+    model_dir         : directory containing ``256x256_diffusion_uncond.pt``.
+                        Default: ``"defense/models"``.
+    t                 : base DDPM noise level.  Lower values are less destructive.
+                        Default: 170 (vs. WaveDM's 250).
     wavelet           : mother wavelet for frequency analysis.  Default: 'haar'.
-    wt_threshold      : soft-threshold applied to HF subbands in pre-denoising.
-                        Default: 0.018.
-    sd_size           : resolution used internally by SD (512 × 512 for SD-v1.5;
-                        768 × 768 for SD-v2-base).  Default: 512.
-    device            : torch device.  Default: 'cuda'.
+    threshold_l1      : level-1 wavelet soft-threshold applied to HF subbands.
+                        Default: 0.020.
+    threshold_l2      : level-2 wavelet soft-threshold applied to HF subbands of
+                        the LL subband.  Default: 0.010.
+    ll_blend_alpha    : fraction of the LL subband drawn from the wavelet-
+                        pre-denoised image (vs. the DDPM output) after the
+                        reverse pass.  Higher → better SSIM.  Default: 0.65.
+    hf_blend_alpha    : fraction of the HF subbands (LH/HL/HH) drawn from the
+                        wavelet-pre-denoised image after the reverse pass.
+                        Higher → sharper edges, better LPIPS.  Default: 0.40.
+    adaptive          : if True, scale ``t`` with the estimated perturbation
+                        magnitude so that clean images are barely modified.
+                        Default: True.
+    device            : torch device string.  Default: 'cuda'.
     """
+
+    _MODEL_CFG = dict(
+        attention_resolutions="32,16,8",
+        class_cond=False,
+        diffusion_steps=1000,
+        rescale_timesteps=True,
+        timestep_respacing="1000",
+        image_size=256,
+        learn_sigma=True,
+        noise_schedule="linear",
+        num_channels=256,
+        num_head_channels=64,
+        num_res_blocks=2,
+        resblock_updown=True,
+        use_fp16=True,
+        use_scale_shift_norm=True,
+    )
 
     def __init__(
         self,
-        model_id: str = "runwayml/stable-diffusion-v1-5",
-        base_strength: float = 0.35,
-        guidance_scale: float = 1.0,
-        num_inf_steps: int = 30,
-        ll_blend_alpha: float = 0.15,
+        model_dir: str = "defense/models",
+        t: int = 170,
         wavelet: str = "haar",
-        wt_threshold: float = 0.018,
-        sd_size: int = 512,
+        threshold_l1: float = 0.020,
+        threshold_l2: float = 0.010,
+        ll_blend_alpha: float = 0.65,
+        hf_blend_alpha: float = 0.40,
+        adaptive: bool = True,
         device: str = "cuda",
     ):
-        self.base_strength = base_strength
-        self.guidance_scale = guidance_scale
-        self.num_inf_steps = num_inf_steps
-        self.ll_blend_alpha = ll_blend_alpha
+        self.t = t
         self.wavelet = wavelet
-        self.wt_threshold = wt_threshold
-        self.sd_size = sd_size
+        self.threshold_l1 = threshold_l1
+        self.threshold_l2 = threshold_l2
+        self.ll_blend_alpha = ll_blend_alpha
+        self.hf_blend_alpha = hf_blend_alpha
+        self.adaptive = adaptive
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-        print(f"[Ours] Loading Stable Diffusion model: {model_id} ...")
-        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-            model_id,
-            torch_dtype=dtype,
-            safety_checker=None,
-            requires_safety_checker=False,
-        ).to(self.device)
-        self.pipe.set_progress_bar_config(disable=True)
+        weights_path = os.path.join(model_dir, "256x256_diffusion_uncond.pt")
+        if not os.path.isfile(weights_path):
+            raise FileNotFoundError(
+                f"OursPurifier requires the pretrained weight file:\n  {weights_path}\n"
+                "Download it with:\n"
+                "  bash defense/ours/download_weights.sh"
+            )
+
+        cfg = model_and_diffusion_defaults()
+        cfg.update(self._MODEL_CFG)
+        model, diffusion = create_model_and_diffusion(**cfg)
+        model.load_state_dict(
+            torch.load(weights_path, map_location="cpu"), strict=False
+        )
+        model.requires_grad_(False).eval().to(self.device)
+        if cfg["use_fp16"]:
+            model.convert_to_fp16()
+
+        self.model = model
+        self.diffusion = diffusion
+        betas = torch.from_numpy(diffusion.betas).float().to(self.device)
+        self._alphas_cumprod = (1.0 - betas).cumprod(dim=0)
         print("[Ours] Model ready.")
 
     # ------------------------------------------------------------------ #
-    # Adaptive strength estimation
+    # Adaptive noise-level estimation
     # ------------------------------------------------------------------ #
 
-    # Threshold below which the perturbation is considered benign (ε=4/255 ≈ 0.016)
-    _BASE_EPS: float = 0.016
-    # Each doubling of perturbation beyond _BASE_EPS adds this much extra strength
-    _STRENGTH_SCALE_FACTOR: float = 0.15
+    _BASE_EPS: float = 0.016   # ε = 4/255
+    _T_SCALE: float  = 0.30    # +30 % per doubling of perturbation
 
-    @staticmethod
-    def _estimate_strength(adv: torch.Tensor, clean_approx: torch.Tensor,
-                           base: float) -> float:
-        """
-        Adaptively scale the img2img strength based on the perturbation magnitude.
-
-        adv and clean_approx are CHW or (1,C,H,W) tensors in [0,1].
-        """
-        _BASE_EPS = 0.016          # ε=4/255
-        _STRENGTH_SCALE_FACTOR = 0.15
-        diff = (adv.float() - clean_approx.float()).abs().max().item()
-        scale = 1.0 + max(0.0, diff - _BASE_EPS) / _BASE_EPS * _STRENGTH_SCALE_FACTOR
-        return float(min(base * scale, 0.65))
-
-    # ------------------------------------------------------------------ #
-    # Single-image purification (CHW, float32, [0,1])
-    # ------------------------------------------------------------------ #
-
-    def _purify_single(self, adv: torch.Tensor) -> torch.Tensor:
-        C, H, W = adv.shape
-        arr = adv.cpu().numpy()
-
-        # ── Wavelet pre-denoising ────────────────────────────────────────
-        LL, LH, HL, HH = _dwt2(arr, self.wavelet)
-        LH_t = _soft_threshold(LH, self.wt_threshold)
-        HL_t = _soft_threshold(HL, self.wt_threshold)
-        HH_t = _soft_threshold(HH, self.wt_threshold)
-        wt_clean = _idwt2(LL, LH_t, HL_t, HH_t, self.wavelet)
-        wt_clean = np.clip(wt_clean, 0.0, 1.0).astype(np.float32)
-        wt_tensor = torch.from_numpy(wt_clean)
-
-        # ── Adaptive strength ─────────────────────────────────────────────
-        strength = self._estimate_strength(adv, wt_tensor, self.base_strength)
-
-        # ── Resize to SD internal resolution ──────────────────────────────
-        pil_in = _tensor_to_pil(wt_tensor)
-        orig_size = pil_in.size          # (W, H) PIL convention
-        pil_resized = pil_in.resize((self.sd_size, self.sd_size), Image.LANCZOS)
-
-        # ── Stable Diffusion img2img ───────────────────────────────────────
-        result = self.pipe(
-            prompt="",
-            image=pil_resized,
-            strength=strength,
-            guidance_scale=self.guidance_scale,
-            num_inference_steps=self.num_inf_steps,
-        ).images[0]
-
-        # ── Resize back to original resolution ───────────────────────────
-        result = result.resize(orig_size, Image.LANCZOS)
-        out_tensor = _pil_to_tensor(result)
-
-        # ── Frequency-guided LL blending ─────────────────────────────────
-        # Replace a fraction of the LL subband in the LDM output with the
-        # LL subband of the wavelet-pre-denoised input, helping to preserve
-        # large-scale structure and boost SSIM.
-        out_arr = out_tensor.numpy()
-        LL_out, LH_out, HL_out, HH_out = _dwt2(out_arr, self.wavelet)
-
-        # LL from wavelet-pre-denoised adversarial image (cleaner low-freq)
-        LL_src, _, _, _ = _dwt2(wt_clean, self.wavelet)
-
-        # Blend: alpha * LL_src + (1-alpha) * LL_out
-        alpha = self.ll_blend_alpha
-        LL_blended = alpha * LL_src + (1.0 - alpha) * LL_out
-
-        blended_arr = _idwt2(LL_blended, LH_out, HL_out, HH_out, self.wavelet)
-        blended_arr = np.clip(blended_arr, 0.0, 1.0).astype(np.float32)
-
-        return torch.from_numpy(blended_arr)
+    def _estimate_t(self, adv: torch.Tensor, wt_clean: torch.Tensor) -> int:
+        """Scale t with the estimated l∞ perturbation magnitude."""
+        diff = (adv.float() - wt_clean.float()).abs().max().item()
+        scale = 1.0 + max(0.0, diff - self._BASE_EPS) / self._BASE_EPS * self._T_SCALE
+        return max(1, int(min(round(self.t * scale), 300)))
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -272,12 +252,84 @@ class OursPurifier:
         if not batched:
             adv_image = adv_image.unsqueeze(0)
 
-        results = []
-        for b in range(adv_image.shape[0]):
-            clean = self._purify_single(adv_image[b])
-            results.append(clean)
+        B, C, H, W = adv_image.shape
 
-        out = torch.stack(results, dim=0)
+        # ── Step 1: Multi-level wavelet pre-denoising ────────────────────
+        wt_clean_list = []
+        for b in range(B):
+            arr = adv_image[b].cpu().numpy()
+            denoised = _multilevel_wavelet_denoise(
+                arr, self.wavelet, self.threshold_l1, self.threshold_l2
+            )
+            wt_clean_list.append(torch.from_numpy(denoised))
+        wt_clean = torch.stack(wt_clean_list, dim=0).to(self.device)  # (B,C,H,W) [0,1]
+
+        # ── Step 2: Adaptive noise level ─────────────────────────────────
+        # Use the maximum t across the batch so the most-perturbed image is
+        # fully denoised while lightly-perturbed images benefit from the same
+        # conservative pass (over-denoising is mild at low t values).
+        if self.adaptive:
+            t_use = max(
+                self._estimate_t(adv_image[b], wt_clean_list[b])
+                for b in range(B)
+            )
+        else:
+            t_use = self.t
+
+        # ── Step 3: Resize to 256×256 if needed ──────────────────────────
+        orig_size = (H, W)
+        x0 = wt_clean
+        if H != 256 or W != 256:
+            x0 = F.interpolate(x0, size=(256, 256), mode="bilinear", align_corners=False)
+
+        # ── Step 4: DDPM forward pass (add noise at level t_use) ─────────
+        x0_scaled = (x0 - 0.5) * 2.0
+        noise = torch.randn_like(x0_scaled)
+        a = self._alphas_cumprod[t_use - 1]
+        x = x0_scaled * a.sqrt() + noise * (1.0 - a).sqrt()
+
+        # ── Step 5: DDPM reverse pass (denoise back to t=0) ──────────────
+        for i in reversed(range(t_use)):
+            t_batch = torch.tensor([i] * B, device=self.device)
+            x = self.diffusion.p_sample(
+                self.model, x, t_batch,
+                clip_denoised=True,
+                denoised_fn=None,
+                cond_fn=None,
+                model_kwargs=None,
+            )["sample"]
+
+        # ── Step 6: Rescale back to [0,1] and restore original size ──────
+        x = ((x + 1.0) * 0.5).clamp(0.0, 1.0)
+        if orig_size != (256, 256):
+            x = F.interpolate(x, size=orig_size, mode="bilinear", align_corners=False)
+
+        # ── Step 7: Post-diffusion multi-scale frequency fusion ──────────
+        # Blend LL (global structure) and HF (edges/texture) subbands from
+        # the wavelet-pre-denoised image back into the DDPM output.  This
+        # step is the key differentiator from plain WaveDM.
+        fused_list = []
+        for b in range(B):
+            out_arr = x[b].cpu().numpy()          # CHW [0,1]
+            ref_arr = wt_clean[b].cpu().numpy()   # CHW [0,1]
+
+            LL_out, LH_out, HL_out, HH_out = _dwt2(out_arr, self.wavelet)
+            LL_ref, LH_ref, HL_ref, HH_ref = _dwt2(ref_arr, self.wavelet)
+
+            # LL fusion: restore global structure from wavelet-pre-denoised image
+            LL_fused = (self.ll_blend_alpha * LL_ref
+                        + (1.0 - self.ll_blend_alpha) * LL_out)
+
+            # HF fusion: blend in edges and texture
+            LH_fused = self.hf_blend_alpha * LH_ref + (1.0 - self.hf_blend_alpha) * LH_out
+            HL_fused = self.hf_blend_alpha * HL_ref + (1.0 - self.hf_blend_alpha) * HL_out
+            HH_fused = self.hf_blend_alpha * HH_ref + (1.0 - self.hf_blend_alpha) * HH_out
+
+            fused_arr = _idwt2(LL_fused, LH_fused, HL_fused, HH_fused, self.wavelet)
+            fused_arr = np.clip(fused_arr, 0.0, 1.0).astype(np.float32)
+            fused_list.append(torch.from_numpy(fused_arr))
+
+        out = torch.stack(fused_list, dim=0)
         if not batched:
             out = out.squeeze(0)
         return out

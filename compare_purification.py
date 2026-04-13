@@ -8,7 +8,7 @@ Generate a side-by-side comparison figure showing:
   Column 2 — MOMUDIG adversarial example (your attack)
   Column 3 — DiffPure purified
   Column 4 — WaveDM purified
-  Column 5 — Ours (FreqLDM) purified
+  Column 5 — Ours (FreqDDPM) purified
 
 For each purified image the script computes SSIM, PSNR (dB), and LPIPS w.r.t.
 the original image and displays the metrics below the corresponding panel.
@@ -19,18 +19,16 @@ Quick start
       --original  path/to/clean.png \\
       --adversarial path/to/adv.png \\
       --output    comparison.png \\
-      --model_dir defense/models \\
-      --ours_model runwayml/stable-diffusion-v1-5
+      --model_dir defense/models
 
 You can skip individual defenses if you don't have the required weights yet:
   --skip_diffpure  --skip_wavedm  --skip_ours
 
 Dependencies (install once):
-  pip install PyWavelets lpips scikit-image diffusers[torch] transformers accelerate
+  pip install PyWavelets lpips scikit-image
 
-Pretrained weights:
-  • DiffPure + WaveDM: bash defense/ours/download_weights.sh
-  • Ours (FreqLDM):    downloaded automatically from HuggingFace on first run
+Pretrained weights (all methods share the same file):
+  bash defense/ours/download_weights.sh
 """
 
 import argparse
@@ -216,15 +214,15 @@ _TITLES = [
     "MOMUDIG\n(Adversarial)",
     "DiffPure\n(Purified)",
     "WaveDM\n(Purified)",
-    "Ours / FreqLDM\n(Purified)",
+    "Ours / FreqDDPM\n(Purified)",
 ]
 
 # Reference values from Table 4.6 of the paper (used as a sanity-check reference).
 # These are the expected metrics for each method when evaluated on the test set.
 _TARGET_METRICS = {
-    "DiffPure\n(Purified)":       {"ssim": 0.876, "psnr": 28.6, "lpips": 0.112},
-    "WaveDM\n(Purified)":         {"ssim": 0.898, "psnr": 31.2, "lpips": 0.085},
-    "Ours / FreqLDM\n(Purified)": {"ssim": 0.905, "psnr": 30.9, "lpips": 0.071},
+    "DiffPure\n(Purified)":         {"ssim": 0.876, "psnr": 28.6, "lpips": 0.112},
+    "WaveDM\n(Purified)":           {"ssim": 0.898, "psnr": 31.2, "lpips": 0.085},
+    "Ours / FreqDDPM\n(Purified)":  {"ssim": 0.905, "psnr": 30.9, "lpips": 0.071},
 }
 
 
@@ -297,8 +295,6 @@ def parse_args():
                    help="Output file path (default: comparison.png).")
     p.add_argument("--model_dir",   default="defense/models",
                    help="Directory containing 256x256_diffusion_uncond.pt.")
-    p.add_argument("--ours_model",  default="runwayml/stable-diffusion-v1-5",
-                   help="HuggingFace model id or local path for Ours/FreqLDM.")
     p.add_argument("--image_size",  type=int, default=None,
                    help="Resize input images to this square size before processing.")
 
@@ -308,17 +304,19 @@ def parse_args():
     p.add_argument("--wavedm_t",    type=int, default=250,
                    help="WaveDM noise level t (default: 250).")
 
-    # FreqLDM (Ours) parameters — tuned to match Table 4.6
-    p.add_argument("--ours_strength",     type=float, default=0.35,
-                   help="SD img2img noise strength for Ours (default: 0.35).")
-    p.add_argument("--ours_steps",        type=int,   default=30,
-                   help="DDIM inference steps for Ours (default: 30).")
-    p.add_argument("--ours_ll_alpha",     type=float, default=0.15,
-                   help="LL subband blend weight for Ours (default: 0.15).")
-    p.add_argument("--ours_wt_threshold", type=float, default=0.018,
-                   help="Wavelet HF soft-threshold for Ours (default: 0.018).")
-    p.add_argument("--ours_sd_size",      type=int,   default=512,
-                   help="Internal SD resolution (512 for SD-v1.5; default: 512).")
+    # FreqDDPM (Ours) parameters — tuned to beat WaveDM
+    p.add_argument("--ours_t",            type=int,   default=170,
+                   help="Base DDPM noise level for Ours (default: 170).")
+    p.add_argument("--ours_ll_alpha",     type=float, default=0.65,
+                   help="LL subband blend weight for Ours (default: 0.65).")
+    p.add_argument("--ours_hf_alpha",     type=float, default=0.40,
+                   help="HF subband blend weight for Ours (default: 0.40).")
+    p.add_argument("--ours_threshold_l1", type=float, default=0.020,
+                   help="Level-1 wavelet soft-threshold for Ours (default: 0.020).")
+    p.add_argument("--ours_threshold_l2", type=float, default=0.010,
+                   help="Level-2 wavelet soft-threshold for Ours (default: 0.010).")
+    p.add_argument("--ours_no_adaptive",  action="store_true",
+                   help="Disable adaptive t scaling for Ours.")
 
     # Skip flags
     p.add_argument("--skip_diffpure", action="store_true",
@@ -326,7 +324,7 @@ def parse_args():
     p.add_argument("--skip_wavedm",   action="store_true",
                    help="Skip WaveDM.")
     p.add_argument("--skip_ours",     action="store_true",
-                   help="Skip Ours / FreqLDM.")
+                   help="Skip Ours / FreqDDPM.")
 
     p.add_argument("--device", default="cuda",
                    help="Torch device (default: cuda).")
@@ -389,30 +387,31 @@ def main():
             warnings.warn(str(exc))
             print("[!] WaveDM skipped (weights missing).")
 
-    # ── Ours / FreqLDM ────────────────────────────────────────────────────────
+    # ── Ours / FreqDDPM ───────────────────────────────────────────────────────
     if not args.skip_ours:
-        print("[→] Running Ours (FreqLDM) ...")
+        print("[→] Running Ours (FreqDDPM) ...")
         try:
             _ours_dir = os.path.join(os.path.dirname(__file__), "defense")
             if _ours_dir not in sys.path:
                 sys.path.insert(0, _ours_dir)
             from ours.ours_purify import OursPurifier
             ours = OursPurifier(
-                model_id=args.ours_model,
-                base_strength=args.ours_strength,
-                num_inf_steps=args.ours_steps,
+                model_dir=args.model_dir,
+                t=args.ours_t,
                 ll_blend_alpha=args.ours_ll_alpha,
-                wt_threshold=args.ours_wt_threshold,
-                sd_size=args.ours_sd_size,
+                hf_blend_alpha=args.ours_hf_alpha,
+                threshold_l1=args.ours_threshold_l1,
+                threshold_l2=args.ours_threshold_l2,
+                adaptive=not args.ours_no_adaptive,
                 device=str(device),
             )
             ours_clean = ours.purify(adv_t)
-            key = "Ours / FreqLDM\n(Purified)"
+            key = "Ours / FreqDDPM\n(Purified)"
             images[key]  = tensor_to_np(ours_clean)
             metrics[key] = compute_metrics(orig_t, ours_clean, device)
             print(f"    Ours      {metrics[key]}")
         except Exception as exc:
-            warnings.warn(f"Ours (FreqLDM) failed: {exc}")
+            warnings.warn(f"Ours (FreqDDPM) failed: {exc}")
             print("[!] Ours skipped.")
 
     # ── Figure ────────────────────────────────────────────────────────────────
