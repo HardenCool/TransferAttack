@@ -118,7 +118,7 @@ class SDPurifier:
         """Convert any supported image format to RGB PIL Image."""
         if isinstance(image, Image.Image):
             return image.convert("RGB")
-        if isinstance(image, torch.Tensor):
+        elif isinstance(image, torch.Tensor):
             t = image.detach().cpu()
             if t.ndim == 4:
                 t = t.squeeze(0)

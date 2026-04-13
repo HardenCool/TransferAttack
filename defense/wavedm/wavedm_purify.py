@@ -115,7 +115,7 @@ class WaveDMPurifier:
         """Convert any supported image format to float32 numpy [H, W, 3] in [0, 1]."""
         if isinstance(image, Image.Image):
             return np.array(image.convert("RGB")).astype(np.float32) / 255.0
-        if isinstance(image, torch.Tensor):
+        elif isinstance(image, torch.Tensor):
             t = image.detach().cpu()
             if t.ndim == 4:
                 t = t.squeeze(0)
