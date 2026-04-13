@@ -13,12 +13,11 @@ Key innovations over WaveDM / DiffPure:
   3. **Post-diffusion LL + HF subband fusion** — after the reverse pass, the
      low-frequency (LL) subband from the wavelet-pre-denoised image is blended
      back at a high weight (alpha=0.70) to restore global structure (SSIM), and
-     the high-frequency subbands are lightly blended (beta=0.20) so the DDPM
-     generates natural-looking textures that improve LPIPS.
+     the high-frequency subbands are blended at alpha=0.40 to keep HF texture
+     close to the original, improving LPIPS.
   4. **Perceptual polish pass** — a second very-short DDPM forward-reverse pass
-     (t_refine=25) after the frequency fusion smooths any remaining wavelet
-     reconstruction artefacts and injects natural fine-grain texture, which
-     directly improves LPIPS without altering global structure.
+     (t_refine=10) after the frequency fusion smooths remaining wavelet
+     reconstruction artefacts without injecting perceptually divergent textures.
   5. **Adaptive noise level** — t is scaled with the estimated l∞ perturbation
      magnitude so that lightly-perturbed images are minimally modified.
 
@@ -167,13 +166,16 @@ class OursPurifier:
                         reverse pass.  Higher → better SSIM/PSNR.  Default: 0.70.
     hf_blend_alpha    : fraction of the HF subbands (LH/HL/HH) drawn from the
                         wavelet-pre-denoised image after the reverse pass.
-                        Keeping this low (0.20) lets the DDPM generate natural
-                        fine-grain textures, which improves LPIPS.  Default: 0.20.
+                        Higher values keep HF texture closer to the original
+                        (better LPIPS); lower values let the DDPM generate
+                        unconstrained textures (more artefact-free but
+                        perceptually divergent).  Default: 0.40.
     t_refine          : number of timesteps for the optional perceptual polish
                         pass — a second short DDPM forward-reverse pass applied
                         after the frequency fusion step.  Removes wavelet
-                        reconstruction artefacts and injects natural texture.
-                        Set to 0 to disable.  Default: 25.
+                        reconstruction artefacts.  Larger values inject more
+                        DDPM-generated texture and can hurt LPIPS; keep this
+                        small (≤15).  Set to 0 to disable.  Default: 10.
     adaptive          : if True, scale ``t`` with the estimated perturbation
                         magnitude so that clean images are barely modified.
                         Default: True.
@@ -205,8 +207,8 @@ class OursPurifier:
         threshold_l1: float = 0.020,
         threshold_l2: float = 0.010,
         ll_blend_alpha: float = 0.70,
-        hf_blend_alpha: float = 0.20,
-        t_refine: int = 25,
+        hf_blend_alpha: float = 0.40,
+        t_refine: int = 10,
         adaptive: bool = True,
         device: str = "cuda",
     ):
@@ -347,9 +349,9 @@ class OursPurifier:
         # ── Step 6: Post-diffusion multi-scale frequency fusion ──────────
         # Blend LL (global structure) at high alpha=0.70 from the wavelet-
         # pre-denoised image to recover SSIM/PSNR.  Blend HF (edges/texture)
-        # at low alpha=0.20 to avoid injecting adversarial residuals from the
-        # thresholded subbands — the DDPM contribution dominates HF texture,
-        # yielding more natural-looking output and better LPIPS.
+        # at alpha=0.40 from the wavelet-pre-denoised image — this keeps HF
+        # texture close enough to the original to maintain good LPIPS, while
+        # still letting the DDPM contribute to removing adversarial residuals.
         fused_list = []
         wt_clean_cpu = wt_clean.cpu()
         for b in range(B):
@@ -372,10 +374,10 @@ class OursPurifier:
 
         # ── Step 7: Perceptual polish pass (optional) ─────────────────────
         # A second very-short DDPM forward-reverse pass removes wavelet
-        # reconstruction artefacts and injects natural fine-grain texture.
-        # At t_refine=25 the forward pass adds only a tiny amount of noise
-        # (alpha_24 ≈ 0.97), so global structure is untouched while
-        # high-frequency artefacts are smoothed and replaced naturally.
+        # reconstruction artefacts.  At t_refine=10 the forward pass adds only
+        # a tiny amount of noise (alpha ≈ 0.99), so global structure is
+        # untouched while high-frequency artefacts are smoothed.  Larger values
+        # inject more DDPM texture and can hurt LPIPS.
         if self.t_refine > 0:
             fused_256 = fused
             if orig_size != (256, 256):
