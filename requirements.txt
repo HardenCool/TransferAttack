@@ -6,3 +6,9 @@ pandas
 timm
 scikit-optimize
 matplotlib
+# WaveDM purifier
+PyWavelets
+# DiT purifier ("Ours")
+diffusers>=0.27.0
+transformers>=4.38.0
+accelerate>=0.27.0
