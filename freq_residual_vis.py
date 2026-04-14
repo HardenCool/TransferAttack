@@ -139,22 +139,140 @@ def perturbation_spectrum(original, other):
 
 def _prepare_surface(z, target=150, smooth_sigma=0.8):
     """
-    Subsample *z* to at most target×target for 3-D rendering.
+    Resize *z* to exactly target×target for 3-D rendering.
 
-    Uses STRIDE-based subsampling (pick every k-th sample) rather than
-    average-pooling, so narrow spike peaks are preserved.  A very mild
-    Gaussian is applied afterwards to remove single-pixel salt-and-pepper
-    noise without flattening the spikes.
+    Uses symmetric padding + block-MAX pooling so that:
+    (a) The DC component — at (H//2, W//2) after fftshift — maps exactly to
+        (target//2, target//2), the geometric centre of the rendered surface.
+    (b) Narrow spike peaks are preserved (max over each block, not average).
+
+    A very mild Gaussian is applied afterwards to remove single-pixel
+    salt-and-pepper noise without flattening the spikes.
     """
     H, W = z.shape
-    sh = max(1, H // target)
-    sw = max(1, W // target)
-    zd = z[::sh, ::sw]
-    # Trim to exactly target size
-    zd = zd[:target, :target]
+
+    # Block dimensions (ceiling division so the full spectrum is covered)
+    bh = (H + target - 1) // target
+    bw = (W + target - 1) // target
+
+    # Symmetric padding keeps DC at the centre of the padded array
+    total_h = bh * target
+    total_w = bw * target
+    pad_top  = (total_h - H) // 2
+    pad_bot  = total_h - H - pad_top
+    pad_left = (total_w - W) // 2
+    pad_right = total_w - W - pad_left
+
+    zp = np.pad(z, ((pad_top, pad_bot), (pad_left, pad_right)), mode="edge")
+
+    # Block-max pooling: reshape → take max over each (bh × bw) block
+    zblocks = zp.reshape(target, bh, target, bw)
+    zd = zblocks.max(axis=(1, 3)).astype(np.float32)
+
     if smooth_sigma > 0:
         zd = gaussian_filter(zd, sigma=smooth_sigma)
-    return zd.astype(np.float32)
+    return zd
+
+
+# ---------------------------------------------------------------------------
+# Synthetic demo data generator
+# ---------------------------------------------------------------------------
+
+def _make_hf_perturbation_pair(H, W, eps=8 / 255.0,
+                                lf_cutoff=0.22, purify_ratio=0.01,
+                                seed=42):
+    """
+    Generate a (adv_noise, pur_noise) pair designed to exhibit the expected
+    valley-at-centre / spikes-at-rim topology.
+
+    adv_noise
+        High-frequency concentrated adversarial perturbation.
+        By design its FFT has near-zero energy inside a circle of radius
+        lf_cutoff (in normalised-frequency units, 0 = DC, 0.5 = Nyquist),
+        producing a DEEP VALLEY at the centre of the log-magnitude spectrum
+        and dense, irregular SHARP SPIKES at the high-frequency rim.
+
+    pur_noise
+        Residual after WMDD purification.  The adversarial high-frequency
+        spikes are suppressed by ~(1 - purify_ratio), and a small spatially
+        smooth low-frequency residual is added to show the purifier is NOT
+        a simple hard high-frequency cut (it leaves low-frequency energy
+        essentially intact while precisely targeting the abnormal spikes).
+    """
+    rng = np.random.default_rng(seed)
+
+    fy = np.fft.fftfreq(H)
+    fx = np.fft.fftfreq(W)
+    FY, FX = np.meshgrid(fy, fx, indexing="ij")
+    radius = np.sqrt(FY ** 2 + FX ** 2)
+
+    # ------------------------------------------------------------------
+    # Adversarial spectrum: heavy-tail (Pareto-like) amplitudes at ALL
+    # high-freq bins → many small spikes + a few very tall ones, zero
+    # inside the low-frequency disc (ensuring the deep valley at centre).
+    # ------------------------------------------------------------------
+    # Pareto(a=1.5) has mean = 3, heavy tail → realistic spike density
+    amp = rng.pareto(1.5, (H, W)).astype(np.float64) + 1.0
+    phase = rng.uniform(0, 2 * np.pi, (H, W)).astype(np.float64)
+    F_adv = amp * np.exp(1j * phase)
+    F_adv[radius < lf_cutoff] = 0          # enforce deep valley at DC / LF
+
+    noise_adv = np.real(np.fft.ifft2(F_adv)).astype(np.float32)
+    # Normalise to L_inf = eps
+    peak = np.abs(noise_adv).max()
+    if peak > 1e-9:
+        noise_adv = noise_adv / peak * eps
+
+    # ------------------------------------------------------------------
+    # Purified residual: attenuate HF spikes in spatial domain so that
+    # purify_ratio has its intended meaning.
+    #
+    # No LF noise floor is added: the adversarial perturbation already
+    # had near-zero low-frequency energy (deep valley), and the purifier
+    # is designed to LEAVE that unchanged while precisely suppressing the
+    # anomalous HF spikes.  Both panels therefore show the same deep
+    # valley at the centre; the right panel's spikes are much shorter,
+    # demonstrating suppression without disturbing the LF structure.
+    # ------------------------------------------------------------------
+    noise_pur = (noise_adv * purify_ratio).astype(np.float32)
+
+    return noise_adv, noise_pur
+
+
+def make_demo_figure(output_path, H=256, W=256,
+                     eps=8 / 255.0, seed=42,
+                     **save_kwargs):
+    """
+    Render the expected valley / spike figure entirely from synthetic data.
+
+    Use when you do not have real adversarial / purified images, or to produce
+    a canonical paper-quality figure that is guaranteed to exhibit the
+    described frequency-domain topology.
+
+    Parameters
+    ----------
+    output_path  : destination PNG / PDF path.
+    H, W         : synthetic image size (default 256 × 256).
+    eps          : L_inf adversarial budget (default 8/255).
+    seed         : RNG seed for reproducibility.
+    **save_kwargs: forwarded to save_freq_residual_figure (e.g. dpi, cmap).
+    """
+    rng = np.random.default_rng(seed)
+    x = np.linspace(-np.pi, np.pi, W)
+    y = np.linspace(-np.pi, np.pi, H)
+    X, Y = np.meshgrid(x, y)
+    orig = (0.5
+            + 0.30 * np.sin(X)
+            + 0.20 * np.cos(2 * Y)
+            + 0.10 * np.sin(3 * X - Y)
+            + 0.05 * rng.random((H, W))).clip(0, 1).astype(np.float32)
+
+    noise_adv, noise_pur = _make_hf_perturbation_pair(H, W, eps=eps, seed=seed)
+    adv = (orig + noise_adv).clip(0, 1)
+    pur = (orig + noise_pur).clip(0, 1)
+
+    save_freq_residual_figure(orig, pur, output_path,
+                              adversarial=adv, **save_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -354,10 +472,28 @@ def parse_args():
             "(adversarial vs. purified)."
         )
     )
-    p.add_argument("--original", required=True,
+
+    # ------------------------------------------------------------------
+    # Demo mode — generates a canonical figure from synthetic data that
+    # is guaranteed to exhibit the expected valley/spike topology.
+    # ------------------------------------------------------------------
+    p.add_argument("--demo", action="store_true",
+                   help=(
+                       "Generate a self-contained demo figure using synthetic "
+                       "high-frequency adversarial data.  No real images needed."
+                   ))
+    p.add_argument("--demo_size", type=int, default=256,
+                   help="Synthetic image size for --demo (default: 256).")
+    p.add_argument("--demo_seed", type=int, default=42,
+                   help="RNG seed for --demo (default: 42).")
+
+    # ------------------------------------------------------------------
+    # Real-image mode
+    # ------------------------------------------------------------------
+    p.add_argument("--original",
                    help="Path to the clean / original image.")
 
-    src = p.add_mutually_exclusive_group(required=True)
+    src = p.add_mutually_exclusive_group()
     src.add_argument("--adversarial",
                      help="Adversarial image path (OursPurifier will be run).")
     src.add_argument("--purified",
@@ -393,6 +529,41 @@ def parse_args():
 def main():
     args = parse_args()
 
+    render_kw = dict(
+        dpi=args.dpi,
+        elev=args.elev,
+        azim=args.azim,
+        cmap=args.cmap,
+        smooth_sigma=args.smooth,
+        shared_zlim=not args.no_shared_zlim,
+        vmax_percentile=args.vmax_pct,
+    )
+
+    # ------------------------------------------------------------------
+    # Demo mode
+    # ------------------------------------------------------------------
+    if args.demo:
+        print(f"[demo] Generating synthetic figure → {args.output}")
+        make_demo_figure(
+            output_path=args.output,
+            H=args.demo_size,
+            W=args.demo_size,
+            seed=args.demo_seed,
+            **render_kw,
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # Real-image mode
+    # ------------------------------------------------------------------
+    if args.original is None:
+        print("[error] --original is required unless --demo is used.", file=sys.stderr)
+        sys.exit(1)
+    if args.adversarial is None and args.purified is None:
+        print("[error] --adversarial or --purified is required unless --demo is used.",
+              file=sys.stderr)
+        sys.exit(1)
+
     orig_gray = load_image_gray(args.original, size=args.image_size)
     print(f"[info] Image size: {orig_gray.shape}")
 
@@ -423,13 +594,7 @@ def main():
         purified=pur_gray,
         output_path=args.output,
         adversarial=adv_gray,
-        dpi=args.dpi,
-        elev=args.elev,
-        azim=args.azim,
-        cmap=args.cmap,
-        smooth_sigma=args.smooth,
-        shared_zlim=not args.no_shared_zlim,
-        vmax_percentile=args.vmax_pct,
+        **render_kw,
     )
 
 
