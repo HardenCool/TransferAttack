@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+collect_results.py
+==================
+Parse ASR log files produced by eval_at.sh, eval_diffpure.sh, and eval_nrp.sh,
+convert to Robust Accuracy (RA = 100 - ASR), and print a Markdown comparison
+table matching the format used in the paper.
+
+Usage
+-----
+    python experiments/collect_results.py [--results_root RESULTS_ROOT]
+
+The script expects the following directory layout (produced by the eval_*.sh
+scripts):
+
+    experiments/results/
+        at/
+            dim.txt      <- contains a line like "ASR:XX.XX%"
+            sgm.txt
+            mig.txt
+            ops.txt      <- optional; skipped if missing
+            mumodig.txt  <- optional; skipped if missing
+        diffpure/
+            dim.log
+            sgm.log
+            mig.log
+            ops.log
+            mumodig.log
+        nrp/
+            dim_eval.log
+            sgm_eval.log
+            mig_eval.log
+            ops_eval.log
+            mumodig_eval.log
+
+All files are optional; missing entries are shown as "--".
+"""
+
+import argparse
+import os
+import re
+import sys
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+ATTACKS = ["dim", "sgm", "mig", "ops", "mumodig"]
+
+# Column headers for the results table
+ATTACK_LABELS = {
+    "dim":     "DIM",
+    "sgm":     "SGM",
+    "mig":     "MIG (≈MUMODIG)",
+    "ops":     "OPS",
+    "mumodig": "MUMODIG",
+}
+
+DEFENSES = ["at", "diffpure", "nrp"]
+
+DEFENSE_LABELS = {
+    "at":       "AT (Adv. Training)",
+    "diffpure": "DiffPure",
+    "nrp":      "NRP",
+}
+
+# Filename patterns per defense
+FILE_PATTERNS = {
+    "at":       "{attack}.txt",
+    "diffpure": "{attack}.log",
+    "nrp":      "{attack}_eval.log",
+}
+
+# Regex to find ASR value in a log / txt file
+ASR_RE = re.compile(r"ASR\s*:\s*([\d.]+)\s*%", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_asr(filepath: str) -> float | None:
+    """Return the first ASR percentage found in *filepath*, or None."""
+    if not os.path.isfile(filepath):
+        return None
+    with open(filepath, "r", errors="replace") as fh:
+        for line in fh:
+            m = ASR_RE.search(line)
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def asr_to_ra(asr: float | None) -> str:
+    """Convert ASR to RA string; return '--' for missing values."""
+    if asr is None:
+        return "--"
+    return f"{100.0 - asr:.1f}"
+
+
+def avg_ra(values: list[str]) -> str:
+    """Compute average RA ignoring '--' placeholders."""
+    nums = [float(v) for v in values if v != "--"]
+    if not nums:
+        return "--"
+    return f"{sum(nums) / len(nums):.1f}"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Collect and display RA results.")
+    parser.add_argument(
+        "--results_root",
+        default=os.path.join(os.path.dirname(__file__), "results"),
+        help="Root directory that contains at/, diffpure/, nrp/ sub-dirs.",
+    )
+    args = parser.parse_args()
+
+    root = args.results_root
+
+    # Collect RA values:  table[defense][attack] = RA_string
+    table: dict[str, dict[str, str]] = {}
+    for defense in DEFENSES:
+        table[defense] = {}
+        for attack in ATTACKS:
+            filename = FILE_PATTERNS[defense].format(attack=attack)
+            filepath = os.path.join(root, defense, filename)
+            asr = parse_asr(filepath)
+            table[defense][attack] = asr_to_ra(asr)
+
+    # Add "Ours" row as placeholders (use "--" so avg_ra handles them cleanly)
+    table["ours"] = {attack: "--" for attack in ATTACKS}
+    DEFENSES_WITH_OURS = DEFENSES + ["ours"]
+    DEFENSE_LABELS["ours"] = "**Ours** (placeholder)"
+
+    # -----------------------------------------------------------------------
+    # Print Markdown table
+    # -----------------------------------------------------------------------
+    attack_cols = [ATTACK_LABELS[a] for a in ATTACKS]
+    header_row = "| 防御方法 | " + " | ".join(attack_cols) + " | 平均鲁棒性 |"
+    sep_row    = "|" + "|".join(["---"] * (len(ATTACKS) + 2)) + "|"
+
+    print("\n## 鲁棒准确率对比 (RA %) — 高迁移攻击\n")
+    print(header_row)
+    print(sep_row)
+
+    for defense in DEFENSES_WITH_OURS:
+        label = DEFENSE_LABELS[defense]
+        vals = [table[defense][a] for a in ATTACKS]
+        avg  = avg_ra(vals)
+        row  = f"| {label} | " + " | ".join(vals) + f" | {avg} |"
+        print(row)
+
+    print()
+    print("> Notes:")
+    print("> - MIG (≈MUMODIG): MIG (Momentum Integrated Gradients, ICCV 2023) is used as")
+    print(">   an in-repo proxy for MUMODIG. Replace with actual MUMODIG results when")
+    print(">   available in adv_data/mumodig/resnet18/.")
+    print("> - OPS: place externally-generated adversarial images in adv_data/ops/resnet18/")
+    print(">   and re-run eval_at.sh / eval_diffpure.sh to populate the OPS column.")
+    print("> - **Ours** rows are placeholders — fill in after running your own defense.")
+    print()
+
+
+if __name__ == "__main__":
+    main()
