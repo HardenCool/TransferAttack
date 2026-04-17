@@ -56,19 +56,25 @@ ATTACK_LABELS = {
     "mumodig": "MUMODIG",
 }
 
-DEFENSES = ["at", "diffpure", "nrp"]
+DEFENSES = ["at", "diffpure", "nrp", "freqpure", "dcpurify"]
 
 DEFENSE_LABELS = {
     "at":       "AT (Adv. Training)",
     "diffpure": "DiffPure",
     "nrp":      "NRP",
+    "freqpure": "FreqPure",
+    "dcpurify": "DC-Purify",
 }
 
-# Filename patterns per defense
+# Filename patterns per defense.
+# FreqPure and DC-Purify run a single global evaluation (not per-attack),
+# so they share one result file stored under their sub-directory.
 FILE_PATTERNS = {
     "at":       "{attack}.txt",
     "diffpure": "{attack}.log",
     "nrp":      "{attack}_eval.log",
+    "freqpure": "freqpure.txt",   # single file — same RA for every attack column
+    "dcpurify": "dcpurify.txt",   # single file — same RA for every attack column
 }
 
 # Regex to find ASR value in a log / txt file
@@ -122,15 +128,27 @@ def main():
 
     root = args.results_root
 
+    # Defenses that share a single result file regardless of attack
+    SINGLE_FILE_DEFENSES = {"freqpure", "dcpurify"}
+
     # Collect RA values:  table[defense][attack] = RA_string
     table: dict[str, dict[str, str]] = {}
     for defense in DEFENSES:
         table[defense] = {}
-        for attack in ATTACKS:
-            filename = FILE_PATTERNS[defense].format(attack=attack)
+        if defense in SINGLE_FILE_DEFENSES:
+            # One file, same RA reported for all attack columns
+            filename = FILE_PATTERNS[defense]
             filepath = os.path.join(root, defense, filename)
             asr = parse_asr(filepath)
-            table[defense][attack] = asr_to_ra(asr)
+            ra  = asr_to_ra(asr)
+            for attack in ATTACKS:
+                table[defense][attack] = ra
+        else:
+            for attack in ATTACKS:
+                filename = FILE_PATTERNS[defense].format(attack=attack)
+                filepath = os.path.join(root, defense, filename)
+                asr = parse_asr(filepath)
+                table[defense][attack] = asr_to_ra(asr)
 
     # Add "Ours" row as placeholders (use "--" so avg_ra handles them cleanly)
     table["ours"] = {attack: "--" for attack in ATTACKS}
@@ -161,6 +179,14 @@ def main():
     print(">   (transferattack/input_transformation/ops.py, ported from the-full/OPS).")
     print("> - MUMODIG: Multi-baseline Monotone DIG with expectation-over-transforms")
     print(">   (transferattack/gradient/mumodig.py, ported from RYC-98/MuMoDIG).")
+    print("> - FreqPure (https://github.com/GaozhengPei/FreqPure): frequency-domain")
+    print(">   filtering + guided-diffusion denoising; evaluated via eval_freqpure.py.")
+    print(">   Uses the same 256x256_diffusion_uncond.pt weights as DiffPure.")
+    print(">   Runs its own internal PGD attack (adaptive evaluation, stricter than")
+    print(">   transfer-attack evaluation); a single RA value covers all attack columns.")
+    print("> - DC-Purify (https://github.com/GaozhengPei/Purification): attention-mask-")
+    print(">   guided selective diffusion purification; evaluated via eval_dcpurify.py.")
+    print(">   Same weights & adaptive-evaluation caveat as FreqPure.")
     print("> - **Ours** rows are placeholders — fill in after running your own defense.")
     print()
 
