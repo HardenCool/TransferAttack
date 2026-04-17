@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 import torch
 import tqdm
@@ -23,6 +24,8 @@ def get_parser():
     parser.add_argument('--output_dir', default='./results', type=str, help='the path to store the adversarial patches')
     parser.add_argument('--targeted', action='store_true', help='targeted attack')
     parser.add_argument('--GPU_ID', default='0', type=str)
+    parser.add_argument('--num_workers', default=None, type=int,
+                        help='DataLoader worker count. Defaults to 0 on Windows, 4 elsewhere.')
     return parser.parse_args()
 
 
@@ -33,7 +36,13 @@ def main():
         os.makedirs(args.output_dir)
 
     dataset = AdvDataset(input_dir=args.input_dir, output_dir=args.output_dir, targeted=args.targeted, eval=args.eval)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batchsize, shuffle=False, num_workers=4)
+    # On Windows the default 'spawn' multiprocessing start method means
+    # num_workers > 0 requires careful bootstrapping; use 0 by default there.
+    if args.num_workers is None:
+        num_workers = 0 if sys.platform.startswith('win') else 4
+    else:
+        num_workers = args.num_workers
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batchsize, shuffle=False, num_workers=num_workers)
 
     if not args.eval:
         if args.ensemble or len(args.model.split(',')) > 1:
@@ -63,7 +72,7 @@ def main():
                 for idx, target_class in enumerate(generation_target_classes):
                     new_output_dir = os.path.join(args.output_dir, str(target_class))
                     new_dataset = AdvDataset(input_dir=args.input_dir, output_dir=new_output_dir, targeted=True, target_class=target_class, eval=args.eval)
-                    new_dataloader = torch.utils.data.DataLoader(new_dataset, batch_size=args.batchsize, shuffle=False, num_workers=4)
+                    new_dataloader = torch.utils.data.DataLoader(new_dataset, batch_size=args.batchsize, shuffle=False, num_workers=num_workers)
                     asr += eval(model, new_dataloader, True)
                 asr /= 10
 
