@@ -20,6 +20,7 @@ attack_zoo = {
     'gra': ('.gradient.gra', 'GRA'),
     'gnp': ('.gradient.gnp', 'GNP'),
     'mig': ('.gradient.mig', 'MIG'),
+    'mumodig': ('.gradient.mumodig', 'MUMODIG'),
     'dta': ('.gradient.dta', 'DTA'),
     'pgn': ('.gradient.pgn', 'PGN'),
     'ncs': ('.gradient.ncs', 'NCS'),
@@ -48,6 +49,7 @@ attack_zoo = {
     'decowa': ('.input_transformation.decowa', 'DeCowA'),
     'l2t': ('.input_transformation.l2t', 'L2T'),
     'bsr': ('.input_transformation.bsr', 'BSR'),
+    'ops': ('.input_transformation.ops', 'OPS'),
     ## Targeted
     'odi': ('.input_transformation.odi.odi', 'ODI'),
     'su': ('.input_transformation.su', 'SU'),

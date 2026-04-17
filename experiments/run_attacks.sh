@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run_attacks.sh
-# Generate adversarial examples for DIM, SGM, and MIG using resnet18 as the
-# surrogate model.  OPS and MUMODIG adversarial examples are expected to be
-# placed externally (see README.md for the required directory layout).
+# Generate adversarial examples for DIM, SGM, MIG, OPS, and MUMODIG using
+# resnet18 as the surrogate model.  All five attacks are now implemented
+# natively in this repository.
 #
 # Usage:
 #   bash experiments/run_attacks.sh [DATA_DIR] [GPU_ID]
@@ -55,8 +55,7 @@ run_attack "dim"
 # ---------- SGM --------------------------------------------------------------
 run_attack "sgm"
 
-# ---------- MIG (integrated-gradient transfer, MUMODIG proxy) ---------------
-# MIG uses its own alpha schedule; override epoch to 10 for speed parity.
+# ---------- MIG (integrated-gradient transfer) -------------------------------
 echo ""
 echo ">>> [mig] generating adversarial examples -> ${ADV_ROOT}/mig/${SURROGATE}"
 python "${REPO_ROOT}/main.py" \
@@ -69,11 +68,21 @@ python "${REPO_ROOT}/main.py" \
     --GPU_ID     "${GPU_ID}"
 echo "<<< [mig] done."
 
+# ---------- OPS (Operator-Perturbation Stochastic) ---------------------------
+# Uses operator sampling (20 ops) + perturbation neighbourhood (10 neighbours).
+# Set num_sample_neighbor / num_sample_operator via the OPS class defaults.
+run_attack "ops"
+
+# ---------- MUMODIG (Multi-baseline Monotone DIG) ----------------------------
+# Uses LB-quantized baseline + expectation-over-transforms IG (6 transforms).
+run_attack "mumodig"
+
 echo ""
 echo "============================================================"
 echo " Attack generation complete."
-echo " External attacks (OPS / MUMODIG) should be placed at:"
-echo "   ${ADV_ROOT}/ops/${SURROGATE}/"
-echo "   ${ADV_ROOT}/mumodig/${SURROGATE}/"
-echo " Images must have the same filenames as those in ${DATA_DIR}/images/."
+echo " Adversarial examples saved to:"
+for ATK in dim sgm mig ops mumodig; do
+    echo "   ${ADV_ROOT}/${ATK}/${SURROGATE}/"
+done
 echo "============================================================"
+

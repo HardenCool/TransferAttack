@@ -51,7 +51,7 @@ ATTACKS = ["dim", "sgm", "mig", "ops", "mumodig"]
 ATTACK_LABELS = {
     "dim":     "DIM",
     "sgm":     "SGM",
-    "mig":     "MIG (≈MUMODIG)",
+    "mig":     "MIG",
     "ops":     "OPS",
     "mumodig": "MUMODIG",
 }
@@ -157,11 +157,10 @@ def main():
 
     print()
     print("> Notes:")
-    print("> - MIG (≈MUMODIG): MIG (Momentum Integrated Gradients, ICCV 2023) is used as")
-    print(">   an in-repo proxy for MUMODIG. Replace with actual MUMODIG results when")
-    print(">   available in adv_data/mumodig/resnet18/.")
-    print("> - OPS: place externally-generated adversarial images in adv_data/ops/resnet18/")
-    print(">   and re-run eval_at.sh / eval_diffpure.sh to populate the OPS column.")
+    print("> - OPS: Operator-Perturbation Stochastic optimization")
+    print(">   (transferattack/input_transformation/ops.py, ported from the-full/OPS).")
+    print("> - MUMODIG: Multi-baseline Monotone DIG with expectation-over-transforms")
+    print(">   (transferattack/gradient/mumodig.py, ported from RYC-98/MuMoDIG).")
     print("> - **Ours** rows are placeholders — fill in after running your own defense.")
     print()
 

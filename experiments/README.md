@@ -10,7 +10,7 @@ Section 4.5 of the paper.
 
 ```
 experiments/
-├── run_attacks.sh        # Generate DIM / SGM / MIG adversarial examples
+├── run_attacks.sh        # Generate DIM / SGM / MIG / OPS / MUMODIG adversarial examples
 ├── eval_clean.sh         # Baseline clean-accuracy cross-model eval
 ├── eval_at.sh            # AT defense evaluation
 ├── eval_diffpure.sh      # DiffPure defense evaluation
@@ -27,9 +27,9 @@ Adversarial examples are written to:
 adv_data/
 ├── dim/resnet18/
 ├── sgm/resnet18/
-├── mig/resnet18/          ← in-repo MUMODIG proxy (integrated-gradient)
-├── ops/resnet18/          ← populate externally before running eval scripts
-└── mumodig/resnet18/      ← populate externally before running eval scripts
+├── mig/resnet18/
+├── ops/resnet18/       ← generated natively by run_attacks.sh
+└── mumodig/resnet18/   ← generated natively by run_attacks.sh
 ```
 
 ---
@@ -79,30 +79,21 @@ wget -P defense/models/ \
 
 ---
 
-### 2. Generate adversarial examples (DIM / SGM / MIG)
+### 2. Generate adversarial examples (DIM / SGM / MIG / OPS / MUMODIG)
 
 ```bash
 bash experiments/run_attacks.sh /path/to/data 0
 # GPU_ID=0; change as needed
 ```
 
-This writes adversarial images into `adv_data/{dim,sgm,mig}/resnet18/`.
+This writes adversarial images into
+`adv_data/{dim,sgm,mig,ops,mumodig}/resnet18/`.
 
----
+> **OPS** requires `kornia` for random rotation (already in `requirements.txt`
+> for MUMODIG; install with `pip install kornia` if missing).
+> **MUMODIG** also requires `kornia` for its `RandomRotation` transform.
 
-### 3. Add OPS and MUMODIG adversarial examples (external)
-
-Copy your pre-generated adversarial images into the matching directories.
-**File names must match those in `/path/to/data/images/`.**
-
-```bash
-cp /your/ops/images/*     adv_data/ops/resnet18/
-cp /your/mumodig/images/* adv_data/mumodig/resnet18/
-```
-
----
-
-### 4. Evaluate clean accuracy
+### 3. Evaluate clean accuracy
 
 ```bash
 bash experiments/eval_clean.sh /path/to/data 0
@@ -110,7 +101,7 @@ bash experiments/eval_clean.sh /path/to/data 0
 
 ---
 
-### 5. Evaluate AT defense
+### 4. Evaluate AT defense
 
 ```bash
 bash experiments/eval_at.sh /path/to/data 0
@@ -120,7 +111,7 @@ Results are written to `experiments/results/at/{dim,sgm,mig,ops,mumodig}.txt`.
 
 ---
 
-### 6. Evaluate DiffPure defense
+### 5. Evaluate DiffPure defense
 
 ```bash
 bash experiments/eval_diffpure.sh /path/to/data 0
@@ -134,7 +125,7 @@ Results (with `ASR:XX.XX%` lines) are written to
 
 ---
 
-### 7. Evaluate NRP defense (optional)
+### 6. Evaluate NRP defense (optional)
 
 ```bash
 bash experiments/eval_nrp.sh /path/to/data 0
@@ -142,7 +133,7 @@ bash experiments/eval_nrp.sh /path/to/data 0
 
 ---
 
-### 8. Collect results and print comparison table
+### 7. Collect results and print comparison table
 
 ```bash
 python experiments/collect_results.py --results_root experiments/results
@@ -153,7 +144,7 @@ Example output:
 ```
 ## 鲁棒准确率对比 (RA %) — 高迁移攻击
 
-| 防御方法 | DIM | SGM | MIG (≈MUMODIG) | OPS | MUMODIG | 平均鲁棒性 |
+| 防御方法 | DIM | SGM | MIG | OPS | MUMODIG | 平均鲁棒性 |
 |---|---|---|---|---|---|---|
 | AT (Adv. Training) | 61.5 | 56.4 | 52.8 | 50.5 | -- | 55.3 |
 | DiffPure           | 72.8 | 68.1 | 64.2 | 61.8 | -- | 66.7 |
@@ -171,9 +162,16 @@ Fill in the **Ours** column after running your own defense method.
 |--------|----------|----------|---|------------|-----------|
 | DIM    | Input transformation | Random resize + padding | 16/255 | 10 | ResNet-18 |
 | SGM    | Model-related | Scale residual-path gradients (γ=0.2) | 16/255 | 10 | ResNet-18 |
-| MIG    | Gradient (IG proxy) | Integrated gradients along linear path | 16/255 | 10 | ResNet-18 |
-| OPS    | External | Orthogonal perturbation in pixel space | — | — | — |
-| MUMODIG | External | Multi-baseline monotone integrated gradients | — | — | — |
+| MIG    | Gradient (IG) | Integrated gradients along linear path | 16/255 | 10 | ResNet-18 |
+| OPS    | Input transformation | Operator + perturbation neighbourhood sampling | 16/255 | 10 | ResNet-18 |
+| MUMODIG | Gradient (IG) | Multi-baseline Monotone DIG + expectation-over-transforms | 16/255 | 10 | ResNet-18 |
+
+OPS is implemented in `transferattack/input_transformation/ops.py`
+(ported from [the-full/OPS](https://github.com/the-full/OPS)).
+
+MUMODIG is implemented in `transferattack/gradient/mumodig.py`
+(ported from [RYC-98/MuMoDIG](https://github.com/RYC-98/MuMoDIG)).
+The helper class `LBQuantization` lives in `transferattack/lb_quantization.py`.
 
 All attacks use **ε = 16/255** (L∞) and **ResNet-18** as the surrogate model,
 consistent with the standard evaluation protocol in `README.md`.
